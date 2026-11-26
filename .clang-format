@@ -1,0 +1,13 @@
+---
+BasedOnStyle: LLVM
+IndentWidth: 4
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: None
+AlwaysBreakTemplateDeclarations: Yes
+ColumnLimit: 100
+AlignAfterOpenBracket: Align
+PenaltyBreakBeforeFirstCallParameter: 10000
+BinPackArguments: false
+DerivePointerAlignment: true
+FixNamespaceComments: false
+AccessModifierOffset: -4

@@ -1,58 +1,65 @@
-cmake_minimum_required(VERSION 3.16)
-project(sqlfs C)
+cmake_minimum_required(VERSION 3.25)
 
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_STANDARD_REQUIRED ON)
+project(sqlfs
+    VERSION 1.0
+    DESCRIPTION "A user-mode filesystem stored in SQLite, mounted with macFUSE (FSKit)"
+    LANGUAGES CXX)
 
-add_compile_options(-Wall -Wextra -O2)
+set(CORE_SOURCES
+    src/db/database.h src/db/database.cpp
+    src/core/fs_result.h src/core/file_attributes.h
+    src/core/filesystem.h src/core/filesystem.cpp)
+
+set(FUSE_SOURCES
+    src/main.cpp src/fuse/adapter.h src/fuse/adapter.cpp)
+
+# CMake 3.31 doesn't know how to ask AppleClang for C++26, so pass the flag directly
+add_compile_options(-std=c++26)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON) # We need this for clangd to get a compile_commands.json
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug)
+endif()
+
+# Debug builds catch memory bugs (AddressSanitizer) and undefined behavior (UBSan)
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
+set(WARNINGS
+    -Wall -Wextra -Wpedantic -Werror -Wno-error=unused-parameter -Wno-error=unused-variable
+    -Wno-error=unused-but-set-variable)
 
 find_package(PkgConfig REQUIRED)
+pkg_check_modules(FUSE3 REQUIRED IMPORTED_TARGET fuse3)
+find_package(SQLite3 REQUIRED)
 
-# SQLite: prefer Homebrew version on macOS for latest sqlite3
-if(APPLE)
-    set(ENV{PKG_CONFIG_PATH} "/opt/homebrew/opt/sqlite/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
-endif()
-pkg_check_modules(SQLITE3 REQUIRED sqlite3)
+# Embed schema.sql into the binary as a string constant
+file(READ src/db/schema.sql SCHEMA_SQL)
+configure_file(src/db/schema.h.in generated/schema.h @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS src/db/schema.sql)
 
-# FUSE: macFUSE framework on macOS, fuse3 via pkg-config on Linux
-if(APPLE)
-    set(FUSE_INCLUDE_DIR "/Library/Frameworks/macFUSE.framework/Headers")
-    set(FUSE_LIBRARIES   "-framework macFUSE")
-    if(NOT EXISTS "${FUSE_INCLUDE_DIR}/fuse.h")
-        message(FATAL_ERROR
-            "macFUSE headers not found at ${FUSE_INCLUDE_DIR}.\n"
-            "Install macFUSE 5.1.x from https://macfuse.github.io/")
-    endif()
-else()
-    pkg_check_modules(FUSE3 REQUIRED fuse3)
-    set(FUSE_INCLUDE_DIR ${FUSE3_INCLUDE_DIRS})
-    set(FUSE_LIBRARIES   ${FUSE3_LIBRARIES})
-endif()
+add_library(sqlfs_core STATIC ${CORE_SOURCES})
+target_include_directories(sqlfs_core PUBLIC src ${CMAKE_CURRENT_BINARY_DIR}/generated)
+target_link_libraries(sqlfs_core PUBLIC SQLite::SQLite3)
+target_compile_options(sqlfs_core PRIVATE ${WARNINGS})
 
-add_executable(sqlfs
-    src/main.c
-    src/db.c
-    src/fsops.c
-)
+add_executable(sqlfs ${FUSE_SOURCES})
+target_link_libraries(sqlfs PRIVATE sqlfs_core PkgConfig::FUSE3)
+target_compile_options(sqlfs PRIVATE ${WARNINGS})
 
-target_include_directories(sqlfs PRIVATE
-    src/
-    ${SQLITE3_INCLUDE_DIRS}
-    ${FUSE_INCLUDE_DIR}
-)
+include(FetchContent)
+FetchContent_Declare(Catch2
+    GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+    GIT_TAG v3.8.1
+    GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(Catch2)
 
-target_link_libraries(sqlfs PRIVATE
-    ${SQLITE3_LIBRARIES}
-    ${FUSE_LIBRARIES}
-    pthread
-)
+add_executable(unit_tests tests/unit/filesystem_tests.cpp)
+target_link_libraries(unit_tests PRIVATE sqlfs_core Catch2::Catch2WithMain)
+target_compile_options(unit_tests PRIVATE ${WARNINGS})
 
-target_link_directories(sqlfs PRIVATE
-    ${SQLITE3_LIBRARY_DIRS}
-)
-
-if(NOT APPLE)
-    target_link_directories(sqlfs PRIVATE ${FUSE3_LIBRARY_DIRS})
-endif()
-
-install(TARGETS sqlfs DESTINATION bin)
+enable_testing()
+include(Catch)
+catch_discover_tests(unit_tests)
