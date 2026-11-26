@@ -37,6 +37,15 @@ struct FolderEntry {
     FileKind kind = FileKind::File;
 };
 
+// Space on the disk that holds the database, which is the space sqlfs can grow into
+struct StorageUsage {
+    uint64_t total_bytes = 0;
+    uint64_t free_bytes = 0;
+    uint64_t available_bytes = 0; // free space usable without root
+    uint64_t file_count = 0;
+    uint64_t free_file_slots = 0;
+};
+
 // The user creating a new file becomes its owner
 struct Owner {
     uint32_t uid = 0;

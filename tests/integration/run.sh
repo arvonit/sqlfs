@@ -99,6 +99,26 @@ check "deleted file is gone from the folder" test ! -e "$MOUNT/open.txt"
 check "deleted file is still readable while open" bash -c "[ \"\$(cat <&3)\" = 'still readable' ]"
 exec 3<&-
 
+echo "Extended attributes"
+echo "tagged" >"$MOUNT/tagged.txt"
+xattr -w user.color blue "$MOUNT/tagged.txt"
+check "xattr -w then -p reads it back" \
+    bash -c "[ \"\$(xattr -p user.color '$MOUNT/tagged.txt')\" = blue ]"
+check "xattr -l lists it" bash -c "xattr -l '$MOUNT/tagged.txt' | grep -qx 'user.color: blue'"
+xattr -w user.temp gone "$MOUNT/tagged.txt"
+xattr -d user.temp "$MOUNT/tagged.txt"
+check "xattr -d removes it" bash -c "! xattr -p user.temp '$MOUNT/tagged.txt' 2>/dev/null"
+cp -p "$MOUNT/tagged.txt" "$MOUNT/tagged-copy.txt"
+check "cp -p keeps attributes" \
+    bash -c "[ \"\$(xattr -p user.color '$MOUNT/tagged-copy.txt')\" = blue ]"
+xattr -w user.folder yes "$MOUNT/a"
+check "folders can have attributes" bash -c "[ \"\$(xattr -p user.folder '$MOUNT/a')\" = yes ]"
+check "no AppleDouble ._ files appear" bash -c "! ls -a '$MOUNT' | grep -q '^\._'"
+
+echo "Disk usage"
+check "df reports a nonzero size" \
+    bash -c "[ \"\$(df -k '$MOUNT' | awk 'NR == 2 { print \$2 }')\" -gt 0 ]"
+
 echo "Persistence"
 unmount_sqlfs
 mount_sqlfs
@@ -106,6 +126,8 @@ check "files survive a remount" \
     bash -c "[ \"\$(shasum < '$WORK/random.bin')\" = \"\$(shasum < '$MOUNT/a/random.bin')\" ]"
 check "folders survive a remount" test -d "$MOUNT/a/b/c"
 check "symlinks survive a remount" bash -c "[ \"\$(readlink '$MOUNT/soft.txt')\" = old.txt ]"
+check "attributes survive a remount" \
+    bash -c "[ \"\$(xattr -p user.color '$MOUNT/tagged.txt')\" = blue ]"
 
 unmount_sqlfs
 echo

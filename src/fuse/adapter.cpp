@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <ctime>
 #include <string>
+#include <sys/mount.h>
 #include <vector>
 
 // How long the kernel may cache names and attributes. Kept short because FSKit does not
@@ -85,6 +86,17 @@ static void reply_entry(fuse_req_t req, const FSResult<FileAttributes>& result) 
 
 static void reply_status(fuse_req_t req, const FSResult<void>& result) {
     fuse_reply_err(req, result ? 0 : result.error());
+}
+
+// The kernel asks for attribute data in two steps: first with size 0 to learn how big it is,
+// then again with a buffer of that size
+static void reply_xattr_data(fuse_req_t req, const std::string& data, size_t size) {
+    if (size == 0)
+        fuse_reply_xattr(req, data.size());
+    else if (data.size() > size)
+        fuse_reply_err(req, ERANGE);
+    else
+        fuse_reply_buf(req, data.data(), data.size());
 }
 
 static void on_lookup(fuse_req_t req, fuse_ino_t parent, const char* name) {
@@ -371,6 +383,88 @@ static void on_fsyncdir(fuse_req_t req, fuse_ino_t, int, fuse_file_info*) {
     }
 }
 
+// position is only used by resource forks (com.apple.ResourceFork), which sqlfs doesn't support
+static void on_setxattr(fuse_req_t req, fuse_ino_t id, const char* name, const char* value,
+                        size_t size, int flags, uint32_t position) {
+    try {
+        if (position != 0) {
+            fuse_reply_err(req, EINVAL);
+            return;
+        }
+        reply_status(req,
+                     filesystem(req).set_xattr(id, name, std::string_view(value, size), flags));
+    } catch (...) {
+        fuse_reply_err(req, EIO);
+    }
+}
+
+static void on_getxattr(fuse_req_t req, fuse_ino_t id, const char* name, size_t size,
+                        uint32_t position) {
+    try {
+        if (position != 0) {
+            fuse_reply_err(req, EINVAL);
+            return;
+        }
+        auto value = filesystem(req).get_xattr(id, name);
+        if (!value)
+            fuse_reply_err(req, value.error());
+        else
+            reply_xattr_data(req, *value, size);
+    } catch (...) {
+        fuse_reply_err(req, EIO);
+    }
+}
+
+// The list is every name followed by a '\0', all in one buffer
+static void on_listxattr(fuse_req_t req, fuse_ino_t id, size_t size) {
+    try {
+        auto names = filesystem(req).list_xattrs(id);
+        if (!names) {
+            fuse_reply_err(req, names.error());
+            return;
+        }
+        std::string list;
+        for (const std::string& name : *names) {
+            list += name;
+            list += '\0';
+        }
+        reply_xattr_data(req, list, size);
+    } catch (...) {
+        fuse_reply_err(req, EIO);
+    }
+}
+
+static void on_removexattr(fuse_req_t req, fuse_ino_t id, const char* name) {
+    try {
+        reply_status(req, filesystem(req).remove_xattr(id, name));
+    } catch (...) {
+        fuse_reply_err(req, EIO);
+    }
+}
+
+static void on_statfs(fuse_req_t req, fuse_ino_t) {
+    try {
+        auto usage = filesystem(req).get_usage();
+        if (!usage) {
+            fuse_reply_err(req, usage.error());
+            return;
+        }
+        // macOS uses BSD's struct statfs here instead of POSIX's struct statvfs
+        constexpr uint64_t BLOCK_SIZE = 4096;
+        struct statfs stats{};
+        stats.f_bsize = BLOCK_SIZE;
+        stats.f_iosize = BLOCK_SIZE;
+        stats.f_blocks = usage->total_bytes / BLOCK_SIZE;
+        stats.f_bfree = usage->free_bytes / BLOCK_SIZE;
+        stats.f_bavail = usage->available_bytes / BLOCK_SIZE;
+        stats.f_files = usage->file_count + usage->free_file_slots;
+        stats.f_ffree = usage->free_file_slots;
+        fuse_reply_statfs(req, &stats);
+    } catch (...) {
+        fuse_reply_err(req, EIO);
+    }
+}
+
 static fuse_lowlevel_ops make_operations() {
     fuse_lowlevel_ops ops{};
     ops.lookup = on_lookup;
@@ -396,6 +490,11 @@ static fuse_lowlevel_ops make_operations() {
     ops.readdir = on_readdir;
     ops.releasedir = on_releasedir;
     ops.fsyncdir = on_fsyncdir;
+    ops.setxattr = on_setxattr;
+    ops.getxattr = on_getxattr;
+    ops.listxattr = on_listxattr;
+    ops.removexattr = on_removexattr;
+    ops.statfs = on_statfs;
     return ops;
 }
 

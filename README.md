@@ -79,11 +79,19 @@ CREATE TABLE folder_contents (
   folder_id, name, file_id,
   PRIMARY KEY (folder_id, name)
 ) STRICT;
+
+-- Named metadata on a file, like Finder tags or the quarantine flag
+CREATE TABLE extended_attributes (
+  file_id REFERENCES files(file_id) ON DELETE CASCADE,
+  name, value BLOB,
+  PRIMARY KEY (file_id, name)
+) STRICT;
 ```
 
 Full version: [src/db/schema.sql](src/db/schema.sql). Keeping names separate from files is what
 real Unix filesystems do (directory entries vs. inodes), and it makes hard links work: two rows in
-`folder_contents` simply point at the same `file_id`.
+`folder_contents` simply point at the same `file_id`. `ON DELETE CASCADE` means that deleting a
+file also deletes its extended attributes, with no cleanup code.
 
 ## Design decisions
 
@@ -115,7 +123,12 @@ the database easy to inspect, but it's the main tradeoff (see below).
   slow (quadratic in the file size). Files are limited to SQLite's ~1 GB BLOB maximum. Splitting
   contents into fixed-size chunks would fix both.
 - **Single-threaded**: requests are handled one at a time.
-- No extended attributes (xattrs) or `statfs` yet. `RENAME_EXCHANGE` (atomic swap) isn't supported.
+- Extended attribute values are limited to 64 KiB, and resource forks (`com.apple.ResourceFork`,
+  which needs a write offset) aren't supported. `RENAME_EXCHANGE` (atomic swap) isn't supported.
+- Disk space (`df`, Finder) mirrors the disk that holds the database file, since that's the space
+  sqlfs can grow into. `df` shows **Used** as 0 because it reads a volume attribute
+  (`ATTR_VOL_SPACEUSED`) that macFUSE's FSKit backend doesn't fill in. Size and Available are
+  correct.
 - FSKit doesn't support FUSE's cache-invalidation notifications, so the kernel caches attributes
   for only 1 second.
 - Inode numbers that programs see through `stat` come from FSKit and don't match `file_id`.

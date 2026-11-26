@@ -53,6 +53,15 @@ public:
     void release(uint64_t id);
     FSResult<void> sync();
 
+    // Extended attributes. flags may contain XATTR_CREATE or XATTR_REPLACE
+    FSResult<void> set_xattr(uint64_t id, const std::string& name, std::string_view value,
+                             int flags);
+    FSResult<std::string> get_xattr(uint64_t id, const std::string& name);
+    FSResult<std::vector<std::string>> list_xattrs(uint64_t id);
+    FSResult<void> remove_xattr(uint64_t id, const std::string& name);
+
+    FSResult<StorageUsage> get_usage();
+
 private:
     struct OpenCounts {
         uint64_t lookups = 0;
@@ -65,5 +74,6 @@ private:
     void delete_if_unused(uint64_t id);
 
     Database database;
+    std::string database_path;
     std::map<uint64_t, OpenCounts> open_counts;
 };

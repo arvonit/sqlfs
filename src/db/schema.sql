@@ -27,5 +27,14 @@ CREATE TABLE IF NOT EXISTS folder_contents (
   PRIMARY KEY (folder_id, name)
 ) STRICT;
 
+-- Named metadata attached to a file, like Finder tags or the quarantine flag. Deleting a file
+-- deletes its attributes too (ON DELETE CASCADE)
+CREATE TABLE IF NOT EXISTS extended_attributes (
+  file_id INTEGER NOT NULL REFERENCES files(file_id) ON DELETE CASCADE,
+  name    TEXT NOT NULL,
+  value   BLOB NOT NULL,
+  PRIMARY KEY (file_id, name)
+) STRICT;
+
 -- Finds a file's names quickly (used by rename and hard-link bookkeeping)
 CREATE INDEX IF NOT EXISTS folder_contents_by_file ON folder_contents (file_id);

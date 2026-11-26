@@ -6,7 +6,9 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <sys/xattr.h>
 #include <unistd.h>
+#include <vector>
 
 const Owner ME{501, 20};
 
@@ -276,4 +278,91 @@ TEST_CASE("data survives remounting") {
     REQUIRE(file);
     CHECK(t.read_all(file->id) == "persistent");
     REQUIRE(t.fs->sync());
+}
+
+TEST_CASE("extended attributes can be set, read, listed, and removed") {
+    TestFilesystem t;
+    uint64_t id = t.create(ROOT_FILE_ID, "tagged");
+    auto before = *t.fs->get_attributes(id);
+
+    REQUIRE(t.fs->set_xattr(id, "user.color", "blue", 0));
+    REQUIRE(t.fs->set_xattr(id, "user.binary", std::string("a\0b", 3), 0));
+    CHECK(*t.fs->get_xattr(id, "user.color") == "blue");
+    CHECK(*t.fs->get_xattr(id, "user.binary") == std::string("a\0b", 3));
+    CHECK(*t.fs->list_xattrs(id) == std::vector<std::string>{"user.binary", "user.color"});
+    CHECK(t.fs->get_attributes(id)->changed_ns >= before.changed_ns);
+
+    REQUIRE(t.fs->set_xattr(id, "user.color", "red", 0));
+    CHECK(*t.fs->get_xattr(id, "user.color") == "red");
+
+    REQUIRE(t.fs->remove_xattr(id, "user.color"));
+    CHECK(t.fs->get_xattr(id, "user.color").error() == ENOATTR);
+    CHECK(t.fs->remove_xattr(id, "user.color").error() == ENOATTR);
+    CHECK(t.fs->list_xattrs(id)->size() == 1);
+}
+
+TEST_CASE("extended attribute flags and limits") {
+    TestFilesystem t;
+    uint64_t id = t.create(ROOT_FILE_ID, "f");
+
+    CHECK(t.fs->set_xattr(id, "user.a", "1", XATTR_REPLACE).error() == ENOATTR);
+    REQUIRE(t.fs->set_xattr(id, "user.a", "1", XATTR_CREATE));
+    CHECK(t.fs->set_xattr(id, "user.a", "2", XATTR_CREATE).error() == EEXIST);
+    REQUIRE(t.fs->set_xattr(id, "user.a", "2", XATTR_REPLACE));
+    CHECK(*t.fs->get_xattr(id, "user.a") == "2");
+
+    CHECK(t.fs->set_xattr(id, std::string(128, 'n'), "x", 0).error() == ENAMETOOLONG);
+    REQUIRE(t.fs->set_xattr(id, std::string(127, 'n'), "x", 0));
+    CHECK(t.fs->set_xattr(id, "user.big", std::string(64 * 1024 + 1, 'x'), 0).error() == E2BIG);
+    REQUIRE(t.fs->set_xattr(id, "user.big", std::string(64 * 1024, 'x'), 0));
+    CHECK(t.fs->set_xattr(9999, "user.a", "1", 0).error() == ENOENT);
+}
+
+TEST_CASE("folders and symlinks can have extended attributes") {
+    TestFilesystem t;
+    uint64_t folder = t.mkdir(ROOT_FILE_ID, "folder");
+    auto link = t.fs->make_symlink(ROOT_FILE_ID, "link", "folder", ME);
+    REQUIRE(link);
+
+    REQUIRE(t.fs->set_xattr(folder, "user.kind", "folder", 0));
+    REQUIRE(t.fs->set_xattr(link->id, "user.kind", "symlink", 0));
+    CHECK(*t.fs->get_xattr(folder, "user.kind") == "folder");
+    CHECK(*t.fs->get_xattr(link->id, "user.kind") == "symlink");
+}
+
+TEST_CASE("extended attributes survive remounting") {
+    TestFilesystem t;
+    uint64_t id = t.create(ROOT_FILE_ID, "f");
+    REQUIRE(t.fs->set_xattr(id, "user.keep", "yes", 0));
+
+    t.reopen();
+    auto file = t.fs->lookup(ROOT_FILE_ID, "f");
+    REQUIRE(file);
+    CHECK(*t.fs->get_xattr(file->id, "user.keep") == "yes");
+}
+
+TEST_CASE("deleting a file deletes its extended attributes") {
+    TestFilesystem t;
+    uint64_t old_id = t.create(ROOT_FILE_ID, "old");
+    REQUIRE(t.fs->set_xattr(old_id, "user.secret", "x", 0));
+    REQUIRE(t.fs->remove_file(ROOT_FILE_ID, "old"));
+    t.fs->forget(old_id, 1);
+
+    // Without AUTOINCREMENT, SQLite reuses the highest deleted file_id, so a leftover attribute
+    // would show up on this new file
+    uint64_t new_id = t.create(ROOT_FILE_ID, "new");
+    CHECK(new_id == old_id);
+    CHECK(t.fs->list_xattrs(new_id)->empty());
+}
+
+TEST_CASE("usage reports the host disk and counts files") {
+    TestFilesystem t;
+    auto before = t.fs->get_usage();
+    REQUIRE(before);
+    CHECK(before->total_bytes > 0);
+    CHECK(before->available_bytes <= before->total_bytes);
+    CHECK(before->file_count == 1); // just the root folder
+
+    t.create(ROOT_FILE_ID, "f");
+    CHECK(t.fs->get_usage()->file_count == 2);
 }

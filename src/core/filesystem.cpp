@@ -4,10 +4,15 @@
 #include <cerrno>
 #include <cstdio>
 #include <ctime>
+#include <filesystem>
+#include <sys/mount.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 constexpr size_t MAX_NAME_LENGTH = 255;
 constexpr uint32_t PERMISSION_BITS = 07777;
+constexpr size_t MAX_XATTR_NAME_LENGTH = XATTR_MAXNAMELEN;
+constexpr size_t MAX_XATTR_VALUE_SIZE = 64 * 1024;
 
 static int64_t now_ns() {
     timespec now;
@@ -194,6 +199,7 @@ FSResult<void> Filesystem::open_database(const std::string& path) {
     auto opened = database.open(path);
     if (!opened)
         return opened;
+    database_path = std::filesystem::absolute(path).string();
 
     Statement create_root(database,
                           "INSERT OR IGNORE INTO files (file_id, kind, permissions, owner_uid, "
@@ -575,6 +581,132 @@ FSResult<void> Filesystem::sync() {
     // With synchronous = NORMAL, commits may sit unsynced in the WAL file. A full checkpoint
     // flushes them into the main database file and syncs it to disk
     return database.execute("PRAGMA wal_checkpoint(FULL)");
+}
+
+static FSResult<void> mark_changed(Database& database, uint64_t id) {
+    Statement update(database, "UPDATE files SET changed_ns = ? WHERE file_id = ?");
+    update.bind(1, now_ns());
+    update.bind(2, (int64_t)id);
+    return update.run();
+}
+
+static FSResult<bool> xattr_exists(Database& database, uint64_t id, const std::string& name) {
+    Statement select(database, "SELECT 1 FROM extended_attributes WHERE file_id = ? AND name = ?");
+    select.bind(1, (int64_t)id);
+    select.bind(2, name);
+    return select.step();
+}
+
+FSResult<void> Filesystem::set_xattr(uint64_t id, const std::string& name, std::string_view value,
+                                     int flags) {
+    if (name.size() > MAX_XATTR_NAME_LENGTH)
+        return std::unexpected(ENAMETOOLONG);
+    if (value.size() > MAX_XATTR_VALUE_SIZE)
+        return std::unexpected(E2BIG);
+    auto file = load_attributes(database, id);
+    if (!file)
+        return std::unexpected(file.error());
+
+    Transaction transaction(database);
+    auto exists = xattr_exists(database, id, name);
+    if (!exists)
+        return std::unexpected(exists.error());
+    if ((flags & XATTR_CREATE) && *exists)
+        return std::unexpected(EEXIST);
+    if ((flags & XATTR_REPLACE) && !*exists)
+        return std::unexpected(ENOATTR);
+
+    Statement upsert(database,
+                     "INSERT INTO extended_attributes (file_id, name, value) VALUES (?, ?, ?) "
+                     "ON CONFLICT (file_id, name) DO UPDATE SET value = excluded.value");
+    upsert.bind(1, (int64_t)id);
+    upsert.bind(2, name);
+    upsert.bind_blob(3, value);
+    auto saved = upsert.run();
+    if (!saved)
+        return saved;
+
+    auto changed = mark_changed(database, id);
+    if (!changed)
+        return changed;
+    return transaction.commit();
+}
+
+FSResult<std::string> Filesystem::get_xattr(uint64_t id, const std::string& name) {
+    Statement select(database,
+                     "SELECT value FROM extended_attributes WHERE file_id = ? AND name = ?");
+    select.bind(1, (int64_t)id);
+    select.bind(2, name);
+    auto found = select.step();
+    if (!found)
+        return std::unexpected(found.error());
+    if (!*found)
+        return std::unexpected(ENOATTR);
+    return select.column_blob(0);
+}
+
+FSResult<std::vector<std::string>> Filesystem::list_xattrs(uint64_t id) {
+    auto file = load_attributes(database, id);
+    if (!file)
+        return std::unexpected(file.error());
+
+    Statement select(database,
+                     "SELECT name FROM extended_attributes WHERE file_id = ? ORDER BY name");
+    select.bind(1, (int64_t)id);
+    std::vector<std::string> names;
+    while (true) {
+        auto has_row = select.step();
+        if (!has_row)
+            return std::unexpected(has_row.error());
+        if (!*has_row)
+            break;
+        names.push_back(select.column_text(0));
+    }
+    return names;
+}
+
+FSResult<void> Filesystem::remove_xattr(uint64_t id, const std::string& name) {
+    Transaction transaction(database);
+    auto exists = xattr_exists(database, id, name);
+    if (!exists)
+        return std::unexpected(exists.error());
+    if (!*exists)
+        return std::unexpected(ENOATTR);
+
+    Statement remove(database, "DELETE FROM extended_attributes WHERE file_id = ? AND name = ?");
+    remove.bind(1, (int64_t)id);
+    remove.bind(2, name);
+    auto removed = remove.run();
+    if (!removed)
+        return removed;
+
+    auto changed = mark_changed(database, id);
+    if (!changed)
+        return changed;
+    return transaction.commit();
+}
+
+// sqlfs can grow until the disk holding its database is full, so report that disk's space
+FSResult<StorageUsage> Filesystem::get_usage() {
+    // BSD statfs has 64-bit block counts. POSIX statvfs is 32-bit on macOS and would overflow
+    // on disks over 16 TiB
+    struct statfs disk;
+    std::string folder = std::filesystem::path(database_path).parent_path().string();
+    if (statfs(folder.c_str(), &disk) != 0)
+        return std::unexpected(errno);
+
+    Statement count(database, "SELECT count(*) FROM files");
+    auto has_row = count.step();
+    if (!has_row)
+        return std::unexpected(has_row.error());
+
+    StorageUsage usage;
+    usage.total_bytes = disk.f_blocks * disk.f_bsize;
+    usage.free_bytes = disk.f_bfree * disk.f_bsize;
+    usage.available_bytes = disk.f_bavail * disk.f_bsize;
+    usage.file_count = (uint64_t)count.column_int(0);
+    usage.free_file_slots = disk.f_ffree;
+    return usage;
 }
 
 FSResult<FileAttributes> Filesystem::add_file(uint64_t folder_id, const std::string& name,
